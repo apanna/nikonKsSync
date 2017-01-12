@@ -6,7 +6,7 @@ Adapted from varianSync.py. Requires sscan and scanProgress IOC's to be running.
 
 __author__   =   Alireza Panna
 __status__   =   Stable
-__version__  =   1-2
+__version__  =   1-3
 __to-do__    =   Need to test usb-6501 to see how fast we can poll camera output lines and how long to wait after
                  sending trigger inputs to the camera. Currently after sending trigger we wait 25ms. Since the camera acquisition
                  starts at rising transition (0->1)  We effectively wait 50ms between exposures. 
@@ -34,7 +34,11 @@ CHANGELOG:
                       since autosave already restores previously saved values.     
 08/04/2016       (AP) Added readback pv's related to acquisition timing, more debug prints added. 
 08/08/2016       (AP) Set interactive plot off (ioff()), incase we are not running  daemon, the figure window should not
-                      display  
+                      display
+01/11/2017       (AP) Remove scanProgress dependency, fix bug in scan abort callback, scan report file title 
+                      updated, exception added if dutycycle list is empty after scan, scan abort sequence now runs in a seperate
+                      thread rather than from the callback function itself, implemented soft sync (rename hardSync() to sync()
+                      as a fallback incase DAQ is disconnected or not working. Update version to 1-3.
 """
 from pcaspy import SimpleServer, Driver
 from epics import *
@@ -43,12 +47,13 @@ import os, sys, datetime, psutil, time
 import threading
 import numpy as np
 import matplotlib.pyplot as plt
+import inspect
 
 sys.path.append(os.path.realpath('../utils'))
 import epicsApps
 
-EXPERIMENT = 'VPFI:'
-DAQ_NAME                      = 'nikonKsSync'
+EXPERIMENT = 'HPFI:'
+DAQ_NAME                      = 'cpiSync'
 NIKON_EXPOSE                  = DAQ_NAME + '/port2/line0' # Output from DAQ to Qi2 requests exposure (0->1 starts exposure)
 NIKON_TRIGGERREADY            = DAQ_NAME + '/port2/line1' # High when Qi2 ready to expose
 NIKON_EXPOSEOUT               = DAQ_NAME + '/port2/line2' # High when it is exposing
@@ -60,6 +65,7 @@ MOTOR_IOC                     = EXPERIMENT + 'KOHZU:'
 DET_IOC                       = EXPERIMENT + 'Qi2:'
 # Nikon Ks PV's
 NIKON_ACQUIRE                 = PV(DET_IOC + 'cam1:Acquire', callback = True)
+NIKON_ACQUIRE_TIME_RBV        = PV(DET_IOC + 'cam1:AcquireTime_RBV', callback = True)
 NIKON_FULL_FILENAME_RBV       = PV(DET_IOC + 'TIFF1:FullFileName_RBV', callback = True)
 NIKON_FILEPATH                = PV(DET_IOC + 'TIFF1:FilePath', callback = False)
 NIKON_IMAGE_MODE              = PV(DET_IOC + 'cam1:ImageMode', callback = False)
@@ -67,13 +73,21 @@ NIKON_TRIGGER_MODE            = PV(DET_IOC + 'cam1:NikonTriggerMode', callback =
 # Nikon AD statistics PV's
 NIKON_STATS_MEAN              = PV(DET_IOC + 'Stats1:MeanValue_RBV', callback = False)
 NIKON_STATS_SIGMA             = PV(DET_IOC + 'Stats1:Sigma_RBV', callback = False)
-# sscan and sscanProgress PV's
+# sscan PV's
 SCAN_DETECTOR_1               = PV(SCAN_IOC + 'scan1.T1PV', callback = False)
 SCAN_ABORT                    = PV(SCAN_IOC + 'AbortScans.PROC', callback = True)
-SCANPROGRESS_IOC              = SCAN_IOC + 'scanProgress:'
-NFINISHED                     = PV(SCANPROGRESS_IOC + 'Nfinished')
-NTOTAL                        = PV(SCANPROGRESS_IOC + 'Ntotal')
-ELAPSED_TIME                  = PV(SCANPROGRESS_IOC + 'totalElapsedTimeStr')
+
+SCAN_1_NPTS                   = PV(SCAN_IOC + 'scan1.NPTS')
+SCAN_2_NPTS                   = PV(SCAN_IOC + 'scan2.NPTS')  
+SCAN_3_NPTS                   = PV(SCAN_IOC + 'scan3.NPTS')
+SCAN_4_NPTS                   = PV(SCAN_IOC + 'scan4.NPTS')  
+
+SCAN_1_BUSY                   = PV(SCAN_IOC + 'scan1.BUSY')
+SCAN_2_BUSY                   = PV(SCAN_IOC + 'scan2.BUSY')
+SCAN_3_BUSY                   = PV(SCAN_IOC + 'scan3.BUSY')
+SCAN_4_BUSY                   = PV(SCAN_IOC + 'scan4.BUSY')
+SCAN_DIM                      = PV(SCAN_IOC + 'ScanDim.VAL')
+
 # Constant numpy arrays for setting digital outputs high or low on NI-DAQs
 LOW  = np.zeros((1,), dtype=np.uint8)
 HIGH = np.ones((1,), dtype=np.uint8)
@@ -99,7 +113,6 @@ pvdb = {
                                    'enums' : ['NONE', 'SRI', 'OXFORD'],
                                    'scan'  : 1,},
     'TRIGGER'                   : {'asyn'  : True},
-    'LIVE_TRIGGER'              : {'asyn'  : True},
     'SEND_TRIGGER'              : {'asyn'  : True},
     'TRIGGER_READY_RBV'         : {'asyn'  : True},
     'EXPOSING_RBV'              : {'asyn'  : True},
@@ -108,14 +121,16 @@ pvdb = {
     'REPORT'                    : {'type'  : 'enum',
                                    'enums' : ['OFF', 'ON'],},
     'ABORT'                     : {'asyn'  : True},
-    'DUTYCYCLE_RBV'             : {'prec' : 6,
-                                   'unit' : '%'},
-    'ACQUIRE_RBV'               : {'prec' : 6,
-                                   'unit' : 's'},
-    'IDLE_RBV'                  : {'prec' : 6,
-                                   'unit' : 's'},
-    'TRIGGER_ACQUIRE_DELAY_RBV' : {'prec' : 6,
-                                   'unit' : 's'},
+    'DUTYCYCLE_RBV'             : {'prec'  : 6,
+                                   'unit'  : '%'},
+    'ACQUIRE_RBV'               : {'prec'  : 6,
+                                   'unit'  : 's'},
+    'IDLE_RBV'                  : {'prec'  : 6,
+                                   'unit'  : 's'},
+    'TRIGGER_ACQUIRE_DELAY_RBV' : {'prec'  : 6,
+                                   'unit'  : 's'},
+    'SYNC_MODE_RBV'             : {'type'  : 'enum',
+                                   'enums' : ['SOFT', 'HARD'],},
 }
 pvdb.update(epicsApps.pvdb)
 
@@ -134,12 +149,16 @@ class myDriver(Driver):
         self.pulseDelayAvrg = []
         # callback PV's
         NIKON_FULL_FILENAME_RBV.add_callback(self.checkDoc)    
-        SCAN_ABORT.add_callback(self.stopAll) 
+        SCAN_ABORT.add_callback(self.scanAbortCallback) 
         self.xrayReadyTime          = 0
         self.shutter_close          = 0
         self.shutter_open           = 0
         self.idleTime               = 0
         self.trigger_not_ready_rbv  = 0
+        self.total_npts             = 0
+        self.scanStartTime          = 0
+        self.elapsedScanTime        = 0
+        self.total_cpts             = 0
         self.dutyCycleList          = []
         self.shutterTimeList        = []
         self.mean_stats             = []
@@ -150,18 +169,26 @@ class myDriver(Driver):
         self.ax = self.fig.add_subplot(1, 1, 1)
         # Set up DO task to trigger Qi2 expose
         self.written = int32()
-        self.Qi2TriggerTask = TaskHandle()
-        DAQmxCreateTask("",byref(self.Qi2TriggerTask))
-        DAQmxCreateDOChan(self.Qi2TriggerTask, NIKON_EXPOSE, "", DAQmx_Val_ChanForAllLines)
-        DAQmxStartTask(self.Qi2TriggerTask)     
-        # Set up polling for the 2 Qi2 Inputs
-        self.qi2PollTask = TaskHandle()
-        DAQmxCreateTask("",byref(self.qi2PollTask))
-        DAQmxCreateDIChan(self.qi2PollTask, NIKON_INPUTS , "", DAQmx_Val_ChanForAllLines)
-        DAQmxStartTask(self.qi2PollTask)
-        # Start the Qi2 polling thread
-        self.xid = threading.Thread(target=self.pollQi2,args=())
-        self.xid.start()
+        try:
+            self.qi2TriggerTask = TaskHandle()
+            DAQmxCreateTask("",byref(self.qi2TriggerTask))
+            DAQmxCreateDOChan(self.qi2TriggerTask, NIKON_EXPOSE, "", DAQmx_Val_ChanForAllLines)
+            DAQmxStartTask(self.qi2TriggerTask)     
+            # Set up polling for the 2 Qi2 Inputs
+            self.qi2PollTask = TaskHandle()
+            DAQmxCreateTask("",byref(self.qi2PollTask))
+            DAQmxCreateDIChan(self.qi2PollTask, NIKON_INPUTS , "", DAQmx_Val_ChanForAllLines)
+            DAQmxStartTask(self.qi2PollTask)
+            # Start the Qi2 polling thread
+            self.xid = threading.Thread(target=self.pollQi2,args=())
+            self.xid.start()
+            self.daq_init_flag = 1
+        except:
+            self.daq_init_flag = 0
+            print str(datetime.datetime.now())[:-3], "In function: " + inspect.stack()[0][3] + \
+                  ", Failed to create DAQ task. Check to see if DAQ is connected"
+            pass
+        print self.daq_init_flag
         # Set scan detector PV to NikonSync hard trigger PV on init.
         SCAN_DETECTOR_1.put(EXPERIMENT + 'NikonKsSync:TRIGGER')
         # handle autosave related stuff
@@ -186,13 +213,15 @@ class myDriver(Driver):
             try:
                 p.set_nice(psutil.HIGH_PRIORITY_CLASS)
             except:
-                print str(datetime.datetime.now())[:-3], "Failed setting high priority for this process"
+                print str(datetime.datetime.now())[:-3], "In function: " + inspect.stack()[0][3] + \
+                      ", Failed setting high priority for this process"
         else:
             try:
                 os.nice(-10)
             except IOError:
-                print str(datetime.datetime.now())[:-3], "Could not set high priority"
-            
+                print str(datetime.datetime.now())[:-3], "In function: " + inspect.stack()[0][3] + \
+                      ", Could not set high priority"
+
     def iocStats(self):
         """
         Sets the iocAdmin related records
@@ -205,13 +234,13 @@ class myDriver(Driver):
         self.setParam('UPTIME', str(self.start_time))
         self.setParam('PARENT_ID', os.getpid())
         self.setParam('HEARTBEAT', 0)
-            
+
     def read(self, reason):
         """
         pcaspy native read method
         """
         format_time = ""
-        global XRAY_IOC     
+        global XRAY_IOC
         if reason == 'UPTIME':
             format_time = datetime.datetime.now() - self.start_time
             value  = str(format_time).split(".")[0] 
@@ -239,21 +268,29 @@ class myDriver(Driver):
         if reason == "XSYNC":
            self.setParam(reason, value)
         elif reason == 'TRIGGER' and value == 1:
-            self.hid = threading.Thread(target = self.hardSync)
-            self.hid.daemon = True
-            self.hid.start()
-        elif reason == 'LIVE_TRIGGER' and value == 1:
-            self.lid = threading.Thread(target = self.liveSync)
-            self.lid.daemon = True
-            self.lid.start()
+            if self.daq_init_flag == 1:
+                NIKON_IMAGE_MODE.put(2)   # set image mode to continous
+                NIKON_TRIGGER_MODE.put(1) # set to hard mode (this allows sending trigger through the daq)
+                NIKON_ACQUIRE.put(1)
+            elif self.daq_init_flag == 0:
+                NIKON_IMAGE_MODE.put(2)   # set image mode to continous 
+                NIKON_TRIGGER_MODE.put(2) # set to soft mode 
+                NIKON_ACQUIRE.put(1)
+            self.sync_thread = threading.Thread(target = self.sync)
+            self.sync_thread.daemon = True
+            self.sync_thread.start()
         elif reason == 'SEND_TRIGGER':
-            self.fid = threading.Thread(target = self.sendTrigger, args = (self.Qi2TriggerTask, value))
-            self.fid.daemon = True
-            self.fid.start()
+            if self.daq_init_flag == 1:
+                self.fid = threading.Thread(target = self.sendTrigger, args = (self.qi2TriggerTask, value))
+                self.fid.daemon = True
+                self.fid.start()
         elif reason == "DOC":
             self.setParam(reason, value)
         elif reason == "REPORT":
-            print str(datetime.datetime.now())[:-3], 'POST-SCAN REPORT WILL BE SAVED'
+            if value == 1:
+                print str(datetime.datetime.now())[:-3], 'POST-SCAN REPORT WILL BE SAVED'
+            else:
+                print str(datetime.datetime.now())[:-3], 'POST-SCAN REPORT WILL NOT BE SAVED'
             self.setParam(reason, value)
         elif reason == "DUTYCYCLE_RBV":
             self.setParam(reason, value)
@@ -266,10 +303,16 @@ class myDriver(Driver):
         elif reason == "ABORT" and value == 1:
             self.aid = threading.Thread(target = self.allAbort)
             self.aid.daemon = True
-            self.aid.start()      
+            self.aid.start()
+        elif reason == "SYNC_MODE_RBV":
+            if self.daq_init_flag == 1:
+                value = 1
+            elif self.daq_init_flag == 0:
+                value = 0
+            self.setParam(reason, value)
         self.setParam(reason, value)
         self.updatePVs() 
-        
+
     def pollQi2(self):
         """
         Polls Nikon DS-Qi2 input lines to check for exposing and trigger ready lines
@@ -294,7 +337,6 @@ class myDriver(Driver):
                     self.shutterTime,'s'
                 if newval[0] == 0: # trigger is not ready
                     self.trigger_not_ready_rbv = time.clock()
-                    
             if newval[1] != oldval[1]:
                 if newval[1] == 1: # acquisition started/acquiring
                     print str(datetime.datetime.now())[:-3], 'IDLE TIME:', \
@@ -306,14 +348,11 @@ class myDriver(Driver):
                     self.setParam('TRIGGER_ACQUIRE_DELAY_RBV', self.shutter_open - self.trigger_not_ready_rbv)
                 if newval[1] == 0: # acquisition ended/not acquiring
                     self.notExposing = time.clock()
-                    print self.notExposing - self.shutter_close
                     print str(datetime.datetime.now())[:-3], 'NOT ACQUIRING->NEXT TRIGGER_READY DELAY:', \
                     self.notExposing - self.shutter_close,'s'
-                    
-
             oldval = newval
             self.updatePVs()
-            
+
     def sendTrigger(self, DAQtaskName, value):
         """
         Andrew's compact code to send trigger to Qi2. Used to be setDigiOut
@@ -328,7 +367,7 @@ class myDriver(Driver):
     def processDAQstatus(self, errorcode):
         if errorcode != 0:
             print str(datetime.now())[:-3], "NI-DAQ error! Code:", errorcode
-   
+
     def startXray(self):
         """
         Returns when the x-ray is on and outputting x-rays at set values
@@ -367,37 +406,66 @@ class myDriver(Driver):
         """
         if self.getParam('XSYNC') == 0:
             return
-        elif self.getParam('XSYNC') == 2: # x-ray sync is set to oxford
+        else:
             caput(XRAY_IOC + 'ON', '0')
-        elif self.getParam('XSYNC') == 1: # x-ray sync is set to sri
-            caput(XRAY_IOC + 'ON', 0)
         print str(datetime.datetime.now())[:-3], 'X-ray is off'
-    
-    def hardSync(self):
+
+    def afterScan(self):
+         self.stopXray()
+         self.setParam('TRIGGER', 0)
+         self.elapsedScanTime = str(datetime.timedelta(0, time.clock() - self.scanStartTime))
+         if (self.getParam('REPORT') == 1):
+             # the first two points don't make sense
+             try:
+                 self.dutyCycleList.pop(0)
+                 self.dutyCycleList.pop(1)
+             except:
+                 print str(datetime.datetime.now())[:-3], 'In function: ' + inspect.stack()[0][3] + \
+                       ', self.dutyCycleList is empty'
+                 pass
+             self.reportStatistics()
+             self.scanReport()
+         self.shutterTime   = []
+         self.dutyCycleList = []
+         self.fig.delaxes(self.ax)
+         self.ax = self.fig.add_subplot(1, 1, 1)
+         self.scanStartTime = 0
+         self.total_cpts = 0
+        
+    def sync(self):
         """
         Synchronizes the x-ray source exposure (master clock) with the detector shutter (slave)
         """
-        # sequence for hard sync trigger
-        NIKON_IMAGE_MODE.put(2)   # set image mode to continous
-        NIKON_TRIGGER_MODE.put(1) # set to hard mode (this allows sending trigger through the daq)
-        NIKON_ACQUIRE.put(1)
+        # sequence for sync trigger
+        if self.scanStartTime == 0:
+            self.scanStartTime = time.clock()
         self.startXray()
-        self.write('SEND_TRIGGER', 0)
-        time.sleep(0.025)
-        # check to see if we are ready to expose
-        while self.getParam('TRIGGER_READY_RBV') != 1:
-            time.sleep(POLL_TIME)
-        self.updatePVs()
-        self.write('SEND_TRIGGER', 1)
-        time.sleep(0.025)
-        while self.getParam('EXPOSING_RBV') == 1:
-            time.sleep(POLL_TIME)
-        self.updatePVs()
+        if self.daq_init_flag == 1:
+            self.write('SEND_TRIGGER', 0)
+            time.sleep(0.025)
+            # check to see if we are ready to expose
+            while self.getParam('TRIGGER_READY_RBV') != 1:
+                time.sleep(POLL_TIME)
+            self.updatePVs()
+            self.write('SEND_TRIGGER', 1)
+            time.sleep(0.025)
+            while self.getParam('EXPOSING_RBV') == 1:
+                time.sleep(POLL_TIME)
+            self.updatePVs()
+        elif self.daq_init_flag == 0:
+            print str(datetime.datetime.now())[:-3], 'DETECTOR START EXPOSURE'
+            caput(DET_IOC + 'cam1:SoftTrigger', "1")
+            time.sleep(NIKON_ACQUIRE_TIME_RBV.get())
+            print str(datetime.datetime.now())[:-3], 'DETECTOR END EXPOSURE'
         # scan logic start
-        if caget(SCANPROGRESS_IOC +'running') == 1:
+        if SCAN_1_BUSY.get() or SCAN_2_BUSY.get() or SCAN_3_BUSY.get() or SCAN_4_BUSY.get():
+            self.total_cpts += 1
             caput(SCAN_IOC + 'scan1.WAIT', 0)
-            self.shutterTimeList.append(self.shutterTime)
-            if NFINISHED.get() > 1:
+            if self.daq_init_flag == 1:
+                self.shutterTimeList.append(self.shutterTime)
+            elif self.daq_init_flag == 0:
+                self.shutterTimeList.append(NIKON_ACQUIRE_TIME_RBV.get())
+            if self.total_cpts > 1 and self.daq_init_flag == 1:
                 self.dutyCycleList.append(self.shutterTime/(self.idleTime + self.shutterTime))
                 self.setParam('DUTYCYCLE_RBV',100 *self.shutterTime/(self.idleTime + self.shutterTime))
             # Grab the image statistics right after qi2 is finished exposing.
@@ -405,79 +473,38 @@ class myDriver(Driver):
                 self.mean_stats.append(NIKON_STATS_MEAN.get(as_string=False))
                 self.sigma_stats.append(NIKON_STATS_SIGMA.get(as_string=False))
             # check if all images from scan are done. 
-            if (NFINISHED.get() + 1 == NTOTAL.get()):
-                self.stopXray()
-                self.setParam('TRIGGER', 0)
-                if (self.getParam('REPORT') == 1):
-                    # the first two points doesn't make sense
-                    self.dutyCycleList.pop(0)
-                    self.dutyCycleList.pop(1)
-                    self.reportStatistics()
-                    self.scanReport()
-                self.shutterTime   = []
-                self.dutyCycleList = []
-                self.fig.delaxes(self.ax)
-                self.ax = self.fig.add_subplot(1, 1, 1)
+            if SCAN_DIM.get() == 4:
+                self.total_npts = SCAN_1_NPTS.get()*SCAN_2_NPTS.get()*SCAN_3_NPTS.get()*SCAN_4_NPTS.get()
+            elif SCAN_DIM.get() == 3:
+                self.total_npts = SCAN_1_NPTS.get()*SCAN_2_NPTS.get()*SCAN_3_NPTS.get()
+            elif SCAN_DIM.get() == 2:
+                self.total_npts = SCAN_1_NPTS.get()*SCAN_2_NPTS.get()
+            elif SCAN_DIM.get() == 1:
+                self.total_npts = SCAN_1_NPTS.get()
+            if (self.total_cpts >= self.total_npts):
+                self.afterScan()
             self.updatePVs()
         # single exposure
         else:
             self.stopXray()
             self.setParam('TRIGGER', 0)
         self.updatePVs()
-        
-    """
-    TO-FINISH--> need to check if its faster just to go by the exposing_rbv line in live mode vs
-                 hard mode sync.
-    """    
-    def liveSync(self):
-        """
-        Synchronizes the x-ray source exposure (master clock) with the detector shutter. This method
-        uses only the exposing readback signal from the qi2 and uses live mode.
-        """
-        # sequence for live sync trigger
-        NIKON_IMAGE_MODE.put(0)
-        self.startXray()
-        NIKON_ACQUIRE.put(1)
-        while self.getParam('EXPOSING_RBV') == 1:
-            time.sleep(POLL_TIME)
-        self.updatePVs()
-        # scan logic start
-        if caget(SCANPROGRESS_IOC +'running') == 1:
-            caput(SCAN_IOC + 'scan1.WAIT', 0)
-            # Grab the image statistics right after qi2 is finished exposing.
-            if (self.getParam('REPORT') == 1):
-                self.mean_stats.append(NIKON_STATS_MEAN.get(as_string=False))
-                self.sigma_stats.append(NIKON_STATS_SIGMA.get(as_string=False))
-            # check if all images from scan are done. 
-            if (NFINISHED.get() + 1 == NTOTAL.get()):
-                self.stopXray()
-                self.setParam('LIVE_TRIGGER', 0)
-                if (self.getParam('REPORT') == 1):
-                    self.reportStatistics()
-                    self.scanReport()
-                self.fig.delaxes(self.ax)
-                self.ax = self.fig.add_subplot(1, 1, 1)
-            self.updatePVs()
-        # single exposure
-        else:
-            self.stopXray()
-            self.setParam('LIVE_TRIGGER', 0)
-        self.updatePVs()
-    
+
     def scanReport(self):
         """
         Writes sscan info to text file
         """
         with open(NIKON_FILEPATH.get(as_string = True) + os.sep + 'scanReport_' + time.strftime("%Y%m%d-%H%M%S") + '.txt', 'w+') as f:
-            f.write('# VPFI Scan Report auto-generated on ' + str(datetime.datetime.now()) + '\n')
-            f.write('No. Images in Scan: ' + NTOTAL.get(as_string = True) + '\n')
-            f.write('Total Scan time: (HH:MM:SS) ' + ELAPSED_TIME.get(as_string = True) + '\n')
-            f.write('Camera Acquire time per image during scan: ' + str(np.nanmean(self.shutterTime)) +  \
-                    ' +/- ' +  str(np.nanstd(self.shutterTime)) + ' s/image ' + 'Min:' + \
-                    str(np.nanmin(self.shutterTime)) + ' s/image ' + 'Max: ' + str(np.nanmax(self.shutterTime)) + ' s/image\n')
-            f.write('Camera Duty Cyle during scan: ' + str(100*np.nanmean(self.dutyCycleList)) +  \
-                    ' +/- ' +  str(100*np.nanstd(self.dutyCycleList)) + ' % ' + 'Min:' + \
-                    str(100*np.nanmin(self.dutyCycleList)) + ' % ' + 'Max: ' + str(100*np.nanmax(self.dutyCycleList)) + ' %\n')
+            f.write('# ' + EXPERIMENT.split(':')[0] + ' Scan Report auto-generated on ' + str(datetime.datetime.now()) + '\n')
+            f.write('No. Images in Scan: ' + str(self.total_npts) + '\n')
+            f.write('Total Scan time: (HH:MM:SS) ' + self.elapsedScanTime + '\n')
+            if self.daq_init_flag == 1:
+                f.write('Camera Acquire time per image during scan: ' + str(np.nanmean(self.shutterTime)) +  \
+                        ' +/- ' +  str(np.nanstd(self.shutterTime)) + ' s/image ' + 'Min:' + \
+                        str(np.nanmin(self.shutterTime)) + ' s/image ' + 'Max: ' + str(np.nanmax(self.shutterTime)) + ' s/image\n')
+                f.write('Camera Duty Cyle during scan: ' + str(100*np.nanmean(self.dutyCycleList)) +  \
+                        ' +/- ' +  str(100*np.nanstd(self.dutyCycleList)) + ' % ' + 'Min:' + \
+                        str(100*np.nanmin(self.dutyCycleList)) + ' % ' + 'Max: ' + str(100*np.nanmax(self.dutyCycleList)) + ' %\n')
             if self.getParam('XSYNC') != 0:
                 f.write('Accumulated X-ray Exposure time during scan: ' + str(caget(XRAY_IOC + 'MS_RBV', as_string=False)/60000.) + str(' mins\n'))
                 f.write('Accumulated X-ray Exposure mAs during scan: ' +  caget(XRAY_IOC + 'MAS_RBV', as_string=True) + str(' mAs\n'))
@@ -534,7 +561,7 @@ class myDriver(Driver):
                 f.write(i + " - " + str(j) + '\n')
             f.close()
             print str(datetime.datetime.now())[:-3], 'Document successful.'
-            self.usid = None
+            self.save_params_thread = None
 
     def checkDoc(self, **kw):
         """
@@ -542,18 +569,27 @@ class myDriver(Driver):
         this function will start a thread to save parameter file if DOC is ON.
         """
         if self.getParam('DOC') == 1:
-            self.usid = threading.Thread(target = self.saveParams, args=())
-            self.usid.daemon = True
-            self.usid.start()
+            self.save_params_thread = threading.Thread(target = self.saveParams, args=())
+            self.save_params_thread.daemon = True
+            self.save_params_thread.start()
         else:
             return
 
-    def stopAll(self, **kw):
+    def scanAbortCallback(self, **kw):
         """
-        Shuts the x-ray off and resets all stats if scan is aborted mid-way
+        Start the scan abort thread
+        """
+        self.scan_abort_thread = threading.Thread(target = self.scanAbortSeq, args=())
+        self.scan_abort_thread.daemon = True
+        self.scan_abort_thread.start()
+    
+    def scanAbortSeq(self):
+        """
+        Start the scan abort sequence
         """
         print str(datetime.datetime.now())[:-3], 'START SCAN ABORT SEQUENCE!'
         self.stopXray()
+        self.setParam('TRIGGER', 0)
         if self.getParam('REPORT') == 1:
              self.mean_stats         = []
              self.sigma_stats        = []
@@ -562,10 +598,11 @@ class myDriver(Driver):
              self.fig.delaxes(self.ax)
              self.ax = self.fig.add_subplot(1, 1, 1)
         print str(datetime.datetime.now())[:-3], 'END SCAN ABORT SEQUENCE!'
+        self.scan_abort_thread = None
     
     def allAbort(self):
         """
-        Master all abort sequence. Similar to scan abort callback function stopAll, but in addition
+        Master all abort sequence. Similar to scan abort callback function, but in addition
         stops any moving motors and disables camera acquisition
         """
         print str(datetime.datetime.now())[:-3], 'START MASTER ABORT SEQUENCE!'
